@@ -10,30 +10,11 @@ type Message = {
 const queueName = "rpc-queue";
 const logPath = "./.log";
 
-let connection: amqp.Connection;
-let channel: amqp.Channel;
-
 async function main() {
     log("===== Starting microservice M1 =====");
 
-    // Trying to establish a connection to the queue
-    log("Connecting to " + queueName);
-    try {
-        connection = await amqp.connect("amqp://localhost:5672");
-        channel = await connection.createChannel();
-        await channel.assertQueue(queueName);
-    } catch(err) {
-        log("Failed to connect to " + queueName);
-        log(err);
-        return;
-    }
-    log("Connected to " + queueName);
-
-    // Setting up and starting express
-
     const app = express();
     const PORT = 4444;
-
     app.use(express.json());
 
     // Handle for the /send route
@@ -52,33 +33,50 @@ async function main() {
         // Ideally it would also check for correct body structure, but for now it's fine
         const body: Message = req.body;
 
-        // Trying to create an exclusive queue for this request
-        log("Asserting an exclusive queue");
+        // Trying to connect to the main queue as well as create an exclusive one
+        let connection: amqp.Connection;
+        let channel: amqp.Channel;
         let reply: amqp.Replies.AssertQueue;
+
+        log("Connecting to RabbitMQ");
         try {
+            connection = await amqp.connect("amqp://localhost:5672");
+            channel = await connection.createChannel();
+            await channel.assertQueue(queueName);
             reply = await channel.assertQueue("", { exclusive: true });
         } catch(err) {
-            log("Failed to assert an exclusive queue");
+            log("Failed to connect to RabbitMQ");
             log(err);
 
             res.statusCode = 500;
             res.send("Internal error");
             return;
         }
-        log("Asserted an exclusive queue");
+        log("Connected to RabbitMQ");
 
         // Getting a unique id for this request
         const correlationId = generateId();
+        let gotResponse = false;
+
+        // Setting a 10 second timeout so that the connection isn't open forever
+        setTimeout(() => {
+            if (!gotResponse) {
+                log("Response with id " + correlationId + " timed out");
+                res.statusCode = 500;
+                res.send("Internal error");
+            }
+            channel.close();
+            connection.close();
+        }, 10000);
 
         // Waiting for a response
-        // Ideally I would probably only wait for a certain time for a response, and if it doesn't arrive just abort the operation
         log("Waiting for a response with id " + correlationId);
         channel.consume(reply.queue, (data) => {
             if (data.properties.correlationId === correlationId) {
+                gotResponse = true;
                 log("Got a response with id " + correlationId);
                 res.json(JSON.parse(data.content.toString()));
                 log("Sent the response");
-                return;
             }
         }, { noAck: true });
 
